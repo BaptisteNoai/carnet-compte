@@ -168,9 +168,25 @@
   .hidden{display:none !important;}
   .toolbar{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.85rem;}
   .warn{font-size:.76rem;color:var(--depense);margin-top:.6rem;}
+  .version-badge{
+    position:fixed;
+    top:14px;
+    right:16px;
+    background:var(--paper-card);
+    border:1px solid var(--rule-soft);
+    color:var(--ink-soft);
+    font-family:'IBM Plex Mono',monospace;
+    font-size:.7rem;
+    padding:.25rem .55rem;
+    border-radius:2px;
+    box-shadow:var(--shadow);
+    z-index:10;
+    cursor:default;
+  }
 </style>
 </head>
 <body>
+<div class="version-badge" title="Historique des changements : v7 — détection automatique du format LCL, plus d'écran de mapping à remplir">v7</div>
 <div class="wrap">
   <h1>Mon carnet de comptes</h1>
   <p class="subtitle">Dépose ton export CSV LCL ci-dessous. <b>Rien n'est envoyé nulle part</b> : tout le calcul se fait dans ton navigateur, sur ta machine.</p>
@@ -179,7 +195,10 @@
     <input type="file" id="fileInput" accept=".csv,.txt">
     <div class="dz-title" id="dzTitle">Dépose ton fichier ici, ou clique pour le choisir</div>
     <div class="dz-sub">Export CSV depuis l'espace client LCL (Mes comptes → Télécharger mes opérations)</div>
-    <div class="dz-hint">Format libre : le tableau s'adapte à tes colonnes (date, libellé, débit/crédit ou montant unique).</div>
+    <div class="dz-hint">Format reconnu automatiquement — aucune configuration à faire.</div>
+  </div>
+  <div style="text-align:right;margin-top:.4rem;">
+    <button class="ghost small" id="manualMapBtn" type="button">Le format n'est pas reconnu ? Configurer les colonnes manuellement</button>
   </div>
 
   <div id="mappingCard" class="card section hidden">
@@ -495,6 +514,27 @@ function guessNoHeaderRow(row0){
   return numericCells >= 2;
 }
 
+function detectKnownLCLFormat(rows){
+  // Format LCL sans en-tête : A date, B montant (signé), C type, D vide, E libellé dépense, F libellé revenu
+  if(!rows || rows.length<3) return null;
+  const row0=rows[0];
+  if(!row0 || row0.length<6) return null;
+  if(!parseFrenchDate(row0[0])) return null;
+  if(isNaN(parseFrenchNumber(row0[1]))) return null;
+  const sample=rows.slice(1, Math.min(rows.length-1, 8));
+  let ok=0;
+  sample.forEach(r=>{
+    if(r && r[0] && parseFrenchDate(r[0]) && !isNaN(parseFrenchNumber(r[1]))) ok++;
+  });
+  if(ok < Math.min(3, sample.length)) return null;
+  return {
+    map:{date:0, libelle:-1, libelleDep:4, libelleRev:5, debit:-1, credit:-1, montant:1, solde:-1},
+    amountMode:'single',
+    libelleMode:'split',
+    skipFirstLast:true
+  };
+}
+
 function processText(text){
   const firstLine=text.split(/\r?\n/).find(l=>l.trim().length) || '';
   const delim=detectDelimiter(firstLine);
@@ -504,6 +544,14 @@ function processText(text){
     return;
   }
   fullRows=rows;
+  const known=detectKnownLCLFormat(rows);
+  if(known){
+    noHeaderRow=true;
+    headers=fullRows[0].map((_,i)=>'Colonne '+String.fromCharCode(65+i));
+    rawRows=fullRows;
+    buildTransactions(known.map, known.amountMode, known.libelleMode, known.skipFirstLast);
+    return;
+  }
   noHeaderRow=guessNoHeaderRow(rows[0]);
   buildMappingUI();
 }
@@ -584,6 +632,12 @@ function buildMappingUI(){
   document.getElementById('mappingCard').classList.remove('hidden');
   document.getElementById('mappingCard').scrollIntoView({behavior:'smooth',block:'start'});
 }
+
+document.getElementById('manualMapBtn').addEventListener('click',()=>{
+  if(!fullRows.length){ alert('Dépose d\u2019abord un fichier CSV.'); return; }
+  noHeaderRow=guessNoHeaderRow(fullRows[0]);
+  buildMappingUI();
+});
 
 document.getElementById('noHeaderRow').addEventListener('change',e=>{
   noHeaderRow = e.target.checked;
