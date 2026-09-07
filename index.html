@@ -185,6 +185,9 @@
   <div id="mappingCard" class="card section hidden">
     <div class="section-label"><span>Vérifie les colonnes détectées</span><span class="rule"></span></div>
     <div class="mode-toggle">
+      <label><input type="checkbox" id="noHeaderRow"> Le fichier n'a pas de ligne d'en-tête (la première ligne est déjà une donnée)</label>
+    </div>
+    <div class="mode-toggle">
       <label><input type="radio" name="amountMode" value="split" checked> Colonnes séparées débit / crédit</label>
       <label><input type="radio" name="amountMode" value="single"> Une seule colonne montant (signé)</label>
     </div>
@@ -339,6 +342,8 @@ let rules = savedState ? savedState.rules : DEFAULT_RULES.slice();
 let transactions = savedState ? deserializeTransactions(savedState.transactions) : [];
 let headers = [];
 let rawRows = [];
+let fullRows = [];
+let noHeaderRow = false;
 let catChartInst = null, monthChartInst = null;
 let manualOverrides = savedState ? (savedState.manualOverrides || {}) : {};
 let soldeInfo = savedState ? {debut:deserializeSolde(savedState.soldeDebut), fin:deserializeSolde(savedState.soldeFin)} : {debut:null, fin:null};
@@ -483,16 +488,23 @@ function handleFile(file){
   reader.readAsText(file,'utf-8');
 }
 
+function guessNoHeaderRow(row0){
+  if(!row0 || !row0.length) return false;
+  if(parseFrenchDate(row0[0])) return true;
+  const numericCells = row0.filter(c=>!isNaN(parseFrenchNumber(c)) && c.trim()!=='').length;
+  return numericCells >= 2;
+}
+
 function processText(text){
   const firstLine=text.split(/\r?\n/).find(l=>l.trim().length) || '';
   const delim=detectDelimiter(firstLine);
   const rows=parseCSVText(text,delim);
-  if(rows.length<2){
+  if(rows.length<1){
     showParseWarn("Le fichier ne semble pas contenir de tableau exploitable.");
     return;
   }
-  headers=rows[0].map(h=>h.trim());
-  rawRows=rows.slice(1);
+  fullRows=rows;
+  noHeaderRow=guessNoHeaderRow(rows[0]);
   buildMappingUI();
 }
 
@@ -511,14 +523,32 @@ function guessAllColumns(headersNorm, candidates){
 }
 
 function buildMappingUI(){
+  document.getElementById('noHeaderRow').checked = noHeaderRow;
+  if(noHeaderRow){
+    const colCount = fullRows[0] ? fullRows[0].length : 0;
+    headers = Array.from({length:colCount},(_,i)=>'Colonne '+String.fromCharCode(65+i));
+    rawRows = fullRows;
+  } else {
+    headers = (fullRows[0]||[]).map(h=>h.trim());
+    rawRows = fullRows.slice(1);
+  }
+
   const headersNorm=headers.map(norm);
-  const dateIdx=guessColumn(headersNorm,['date operation','date valeur','date']);
+  let dateIdx=guessColumn(headersNorm,['date operation','date valeur','date']);
   const debitIdx=guessColumn(headersNorm,['debit']);
   const creditIdx=guessColumn(headersNorm,['credit']);
-  const montantIdx=guessColumn(headersNorm,['montant']);
-  const soldeIdx=guessColumn(headersNorm,['solde']);
+  let montantIdx=guessColumn(headersNorm,['montant']);
+  let soldeIdx=guessColumn(headersNorm,['solde']);
+  let libMatches=guessAllColumns(headersNorm,['libelle','intitule','description','operation']);
 
-  const libMatches=guessAllColumns(headersNorm,['libelle','intitule','description','operation']);
+  if(noHeaderRow){
+    // Format LCL sans en-tête : A date, B montant, C type, D solde, E libellé dépense, F libellé revenu
+    if(dateIdx<0) dateIdx=0;
+    if(montantIdx<0 && debitIdx<0 && creditIdx<0 && headers.length>1) montantIdx=1;
+    if(soldeIdx<0 && headers.length>3) soldeIdx=3;
+    if(libMatches.length<2 && headers.length>=6) libMatches=[4,5];
+  }
+
   const libIdx = libMatches[0] ?? -1;
   const libDepIdx = libMatches[0] ?? -1;
   const libRevIdx = libMatches[1] ?? -1;
@@ -555,6 +585,10 @@ function buildMappingUI(){
   document.getElementById('mappingCard').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
+document.getElementById('noHeaderRow').addEventListener('change',e=>{
+  noHeaderRow = e.target.checked;
+  buildMappingUI();
+});
 document.querySelectorAll('input[name=amountMode]').forEach(r=>r.addEventListener('change',toggleAmountMode));
 document.querySelectorAll('input[name=libelleMode]').forEach(r=>r.addEventListener('change',toggleLibelleMode));
 function toggleAmountMode(){
