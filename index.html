@@ -545,7 +545,7 @@ function buildMappingUI(){
     // Format LCL sans en-tête : A date, B montant, C type, D solde, E libellé dépense, F libellé revenu
     if(dateIdx<0) dateIdx=0;
     if(montantIdx<0 && debitIdx<0 && creditIdx<0 && headers.length>1) montantIdx=1;
-    if(soldeIdx<0 && headers.length>3) soldeIdx=3;
+    if(soldeIdx<0 && headers.length>3 && fullRows[0] && !isNaN(parseFrenchNumber(fullRows[0][3])) && fullRows[0][3].trim()!=='') soldeIdx=3;
     if(libMatches.length<2 && headers.length>=6) libMatches=[4,5];
   }
 
@@ -632,46 +632,44 @@ document.getElementById('validateMapping').addEventListener('click',()=>{
   buildTransactions(map,amountMode,libelleMode,skipFirstLast);
 });
 
+function computeRowMontant(row,map,amountMode){
+  if(amountMode==='split'){
+    const d=map.debit>=0 ? parseFrenchNumber(row[map.debit]) : 0;
+    const c=map.credit>=0 ? parseFrenchNumber(row[map.credit]) : 0;
+    const dv=isNaN(d)?0:Math.abs(d);
+    const cv=isNaN(c)?0:Math.abs(c);
+    return cv - dv;
+  }
+  return parseFrenchNumber(row[map.montant]);
+}
+
 function buildTransactions(map,amountMode,libelleMode,skipFirstLast){
   const newTx=[];
   const usedKeys=new Set();
   let skipped=0;
   let newSoldeDebut=null, newSoldeFin=null;
   const lastIdx=rawRows.length-1;
-  if(skipFirstLast && map.solde>=0 && rawRows.length>=2){
+  if(skipFirstLast && rawRows.length>=2){
     const d0=parseFrenchDate(rawRows[0][map.date]);
-    const v0=parseFrenchNumber(rawRows[0][map.solde]);
     const d1=parseFrenchDate(rawRows[lastIdx][map.date]);
-    const v1=parseFrenchNumber(rawRows[lastIdx][map.solde]);
+    const v0 = map.solde>=0 ? parseFrenchNumber(rawRows[0][map.solde]) : computeRowMontant(rawRows[0],map,amountMode);
+    const v1 = map.solde>=0 ? parseFrenchNumber(rawRows[lastIdx][map.solde]) : computeRowMontant(rawRows[lastIdx],map,amountMode);
     if(d0 && !isNaN(v0)) newSoldeDebut={date:d0,value:v0};
     if(d1 && !isNaN(v1)) newSoldeFin={date:d1,value:v1};
   }
   rawRows.forEach((row,i)=>{
     if(skipFirstLast && (i===0 || i===lastIdx)) return;
     const dateStr=row[map.date];
-    let libelle, isIncomeHint=null;
+    let libelle;
     if(libelleMode==='split'){
       const dep=(map.libelleDep>=0 ? row[map.libelleDep] : '').trim();
       const rev=(map.libelleRev>=0 ? row[map.libelleRev] : '').trim();
-      if(rev){ libelle=rev; isIncomeHint=true; }
-      else if(dep){ libelle=dep; isIncomeHint=false; }
-      else libelle='';
+      libelle = dep || rev || '';
     } else {
       libelle=(row[map.libelle]||'').trim();
     }
     const date=parseFrenchDate(dateStr);
-    let montant;
-    if(amountMode==='split'){
-      const d=map.debit>=0 ? parseFrenchNumber(row[map.debit]) : 0;
-      const c=map.credit>=0 ? parseFrenchNumber(row[map.credit]) : 0;
-      const dv=isNaN(d)?0:Math.abs(d);
-      const cv=isNaN(c)?0:Math.abs(c);
-      montant = cv - dv;
-    } else {
-      montant = parseFrenchNumber(row[map.montant]);
-      if(isIncomeHint===true) montant = Math.abs(montant);
-      else if(isIncomeHint===false) montant = -Math.abs(montant);
-    }
+    const montant=computeRowMontant(row,map,amountMode);
     if(!date || !libelle || isNaN(montant) || montant===0){ skipped++; return; }
     const key=makeTxKey(date,libelle,montant,usedKeys);
     newTx.push({key,date,libelle,montant,category:null});
