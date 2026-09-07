@@ -177,7 +177,7 @@
 
   <div id="dropzone" class="dropzone">
     <input type="file" id="fileInput" accept=".csv,.txt">
-    <div class="dz-title">Dépose ton fichier ici, ou clique pour le choisir</div>
+    <div class="dz-title" id="dzTitle">Dépose ton fichier ici, ou clique pour le choisir</div>
     <div class="dz-sub">Export CSV depuis l'espace client LCL (Mes comptes → Télécharger mes opérations)</div>
     <div class="dz-hint">Format libre : le tableau s'adapte à tes colonnes (date, libellé, débit/crédit ou montant unique).</div>
   </div>
@@ -188,7 +188,14 @@
       <label><input type="radio" name="amountMode" value="split" checked> Colonnes séparées débit / crédit</label>
       <label><input type="radio" name="amountMode" value="single"> Une seule colonne montant (signé)</label>
     </div>
+    <div class="mode-toggle">
+      <label><input type="radio" name="libelleMode" value="single" checked> Une seule colonne libellé</label>
+      <label><input type="radio" name="libelleMode" value="split"> Deux colonnes libellé (dépense / revenu séparés)</label>
+    </div>
     <div class="mapping-grid" id="mappingGrid"></div>
+    <div class="mode-toggle" style="margin-top:.3rem;">
+      <label><input type="checkbox" id="skipFirstLast"> Ignorer la première et la dernière ligne (soldes d'ouverture/clôture)</label>
+    </div>
     <div class="mapping-row-actions">
       <button id="validateMapping">Analyser mes comptes</button>
       <span id="mappingWarn" class="warn hidden"></span>
@@ -197,6 +204,7 @@
 
   <div id="dashboard" class="hidden">
 
+    <div id="soldeInfo" class="section-label hidden" style="margin-top:1.5rem;"></div>
     <div class="section summary-strip" id="summaryStrip"></div>
 
     <div class="section filters">
@@ -204,6 +212,7 @@
       <input type="search" id="searchBox" placeholder="Rechercher un libellé…">
       <div class="spacer"></div>
       <button class="ghost small" id="exportCsvBtn">Exporter CSV catégorisé</button>
+      <button class="ghost small" id="clearHistoryBtn">Effacer l'historique</button>
     </div>
 
     <div class="section two-col">
@@ -225,11 +234,13 @@
     <div class="section card">
       <div class="section-label"><span>Règles de catégorisation</span><span class="rule"></span></div>
       <div class="rules-list" id="rulesList"></div>
+  <div class="dz-hint" style="margin:0 0 .8rem;padding-top:0;border-top:none;">Tes règles et corrections sont sauvegardées automatiquement dans ce navigateur, sur cet appareil.</div>
       <div class="add-rule">
         <input type="text" id="newKeyword" placeholder="mot-clé (ex : carrefour)">
         <input type="text" id="newCategory" placeholder="catégorie (ex : Alimentation)">
         <button class="small" id="addRuleBtn">Ajouter</button>
         <button class="ghost small" id="exportRulesBtn">Exporter règles</button>
+        <button class="ghost small" id="resetRulesBtn">Réinitialiser</button>
         <label class="ghost small" style="display:inline-flex;align-items:center;padding:.3rem .55rem;border:1px solid var(--rule);border-radius:2px;cursor:pointer;">
           Importer règles
           <input type="file" id="importRulesInput" accept=".json" style="display:none;">
@@ -282,12 +293,55 @@ const DEFAULT_RULES = [
   ['virement','Virement'],
 ].map(([kw,cat])=>({kw,cat}));
 
-let rules = DEFAULT_RULES.slice();
-let transactions = [];
+const STORAGE_KEY = 'carnetComptes_v1';
+
+function loadSavedState(){
+  try{
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    if(parsed && Array.isArray(parsed.rules)) return parsed;
+  }catch(e){}
+  return null;
+}
+
+function serializeTransactions(txs){
+  return txs.map(t=>({key:t.key,date:t.date.toISOString(),libelle:t.libelle,montant:t.montant,category:t.category}));
+}
+function deserializeTransactions(arr){
+  return (arr||[]).map(t=>({key:t.key,date:new Date(t.date),libelle:t.libelle,montant:t.montant,category:t.category}));
+}
+function serializeSolde(s){ return s ? {date:s.date.toISOString(),value:s.value} : null; }
+function deserializeSolde(s){ return s ? {date:new Date(s.date),value:s.value} : null; }
+
+function saveState(){
+  try{
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      rules,
+      manualOverrides,
+      transactions: serializeTransactions(transactions),
+      soldeDebut: serializeSolde(soldeInfo.debut),
+      soldeFin: serializeSolde(soldeInfo.fin)
+    }));
+  }catch(e){}
+}
+
+function makeTxKey(date, libelle, montant, usedKeys){
+  const base = date.toISOString().slice(0,10)+'|'+norm(libelle)+'|'+montant.toFixed(2);
+  let key = base, n=2;
+  while(usedKeys.has(key)){ key = base+'#'+n; n++; }
+  usedKeys.add(key);
+  return key;
+}
+
+const savedState = loadSavedState();
+let rules = savedState ? savedState.rules : DEFAULT_RULES.slice();
+let transactions = savedState ? deserializeTransactions(savedState.transactions) : [];
 let headers = [];
 let rawRows = [];
 let catChartInst = null, monthChartInst = null;
-let manualOverrides = {};
+let manualOverrides = savedState ? (savedState.manualOverrides || {}) : {};
+let soldeInfo = savedState ? {debut:deserializeSolde(savedState.soldeDebut), fin:deserializeSolde(savedState.soldeFin)} : {debut:null, fin:null};
 
 function stripAccents(s){return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');}
 function norm(s){return stripAccents((s||'').toLowerCase()).trim();}
@@ -388,6 +442,30 @@ fileInput.addEventListener('change',e=>{
   if(e.target.files.length) handleFile(e.target.files[0]);
 });
 
+function initFromStorage(){
+  if(transactions.length>0){
+    document.getElementById('dzTitle').textContent='Ajoute un nouvel export pour compléter ton historique';
+    applyRules();
+    renderRules();
+    populateMonthFilter();
+    renderSoldeInfo(soldeInfo.debut,soldeInfo.fin);
+    document.getElementById('dashboard').classList.remove('hidden');
+    render();
+  }
+}
+initFromStorage();
+
+document.getElementById('clearHistoryBtn').addEventListener('click',()=>{
+  if(!confirm(`Effacer les ${transactions.length} transactions enregistrées ? Tes règles de catégorisation seront conservées.`)) return;
+  transactions=[];
+  manualOverrides={};
+  soldeInfo={debut:null,fin:null};
+  saveState();
+  document.getElementById('dashboard').classList.add('hidden');
+  document.getElementById('dzTitle').textContent='Dépose ton fichier ici, ou clique pour le choisir';
+  document.getElementById('soldeInfo').classList.add('hidden');
+});
+
 function handleFile(file){
   const reader=new FileReader();
   reader.onload=()=>{
@@ -424,25 +502,44 @@ function showParseWarn(msg){
   el.classList.remove('hidden');
 }
 
+function guessAllColumns(headersNorm, candidates){
+  const found=[];
+  headersNorm.forEach((h,i)=>{
+    if(candidates.some(c=>h.includes(c))) found.push(i);
+  });
+  return found;
+}
+
 function buildMappingUI(){
   const headersNorm=headers.map(norm);
   const dateIdx=guessColumn(headersNorm,['date operation','date valeur','date']);
-  const libIdx=guessColumn(headersNorm,['libelle','intitule','description','operation']);
   const debitIdx=guessColumn(headersNorm,['debit']);
   const creditIdx=guessColumn(headersNorm,['credit']);
   const montantIdx=guessColumn(headersNorm,['montant']);
+  const soldeIdx=guessColumn(headersNorm,['solde']);
 
-  const useSplit = debitIdx>=0 || creditIdx>=0 || montantIdx<0;
-  document.querySelector(`input[name=amountMode][value=${useSplit?'split':'single'}]`).checked=true;
+  const libMatches=guessAllColumns(headersNorm,['libelle','intitule','description','operation']);
+  const libIdx = libMatches[0] ?? -1;
+  const libDepIdx = libMatches[0] ?? -1;
+  const libRevIdx = libMatches[1] ?? -1;
+  const useDualLibelle = libMatches.length>=2;
+
+  const useSplitAmount = debitIdx>=0 || creditIdx>=0 || montantIdx<0;
+  document.querySelector(`input[name=amountMode][value=${useSplitAmount?'split':'single'}]`).checked=true;
+  document.querySelector(`input[name=libelleMode][value=${useDualLibelle?'split':'single'}]`).checked=true;
+  document.getElementById('skipFirstLast').checked = useDualLibelle;
 
   const grid=document.getElementById('mappingGrid');
   grid.innerHTML='';
   const fields=[
     {key:'date',label:'Colonne date',guess:dateIdx},
-    {key:'libelle',label:'Colonne libellé',guess:libIdx},
-    {key:'debit',label:'Colonne débit',guess:debitIdx,group:'split'},
-    {key:'credit',label:'Colonne crédit',guess:creditIdx,group:'split'},
-    {key:'montant',label:'Colonne montant',guess:montantIdx>=0?montantIdx:0,group:'single'},
+    {key:'libelle',label:'Colonne libellé',guess:libIdx,group:'libelleSingle'},
+    {key:'libelleDep',label:'Colonne libellé (dépense)',guess:libDepIdx,group:'libelleSplit'},
+    {key:'libelleRev',label:'Colonne libellé (revenu)',guess:libRevIdx,group:'libelleSplit'},
+    {key:'debit',label:'Colonne débit',guess:debitIdx,group:'amountSplit'},
+    {key:'credit',label:'Colonne crédit',guess:creditIdx,group:'amountSplit'},
+    {key:'montant',label:'Colonne montant',guess:montantIdx>=0?montantIdx:0,group:'amountSingle'},
+    {key:'solde',label:'Colonne solde (optionnel)',guess:soldeIdx},
   ];
   fields.forEach(f=>{
     const div=document.createElement('div');
@@ -453,45 +550,84 @@ function buildMappingUI(){
     grid.appendChild(div);
   });
   toggleAmountMode();
+  toggleLibelleMode();
   document.getElementById('mappingCard').classList.remove('hidden');
   document.getElementById('mappingCard').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
 document.querySelectorAll('input[name=amountMode]').forEach(r=>r.addEventListener('change',toggleAmountMode));
+document.querySelectorAll('input[name=libelleMode]').forEach(r=>r.addEventListener('change',toggleLibelleMode));
 function toggleAmountMode(){
   const mode=document.querySelector('input[name=amountMode]:checked').value;
+  const want = mode==='split' ? 'amountSplit' : 'amountSingle';
   document.querySelectorAll('.mapping-field').forEach(el=>{
-    if(!el.dataset.group) return;
-    el.style.display = el.dataset.group===mode ? '' : 'none';
+    if(el.dataset.group==='amountSplit' || el.dataset.group==='amountSingle'){
+      el.style.display = el.dataset.group===want ? '' : 'none';
+    }
+  });
+}
+function toggleLibelleMode(){
+  const mode=document.querySelector('input[name=libelleMode]:checked').value;
+  const want = mode==='split' ? 'libelleSplit' : 'libelleSingle';
+  document.querySelectorAll('.mapping-field').forEach(el=>{
+    if(el.dataset.group==='libelleSplit' || el.dataset.group==='libelleSingle'){
+      el.style.display = el.dataset.group===want ? '' : 'none';
+    }
   });
 }
 
 document.getElementById('validateMapping').addEventListener('click',()=>{
-  const mode=document.querySelector('input[name=amountMode]:checked').value;
+  const amountMode=document.querySelector('input[name=amountMode]:checked').value;
+  const libelleMode=document.querySelector('input[name=libelleMode]:checked').value;
+  const skipFirstLast=document.getElementById('skipFirstLast').checked;
   const get=k=>{
     const sel=document.querySelector(`select[data-field=${k}]`);
     return sel ? parseInt(sel.value,10) : -1;
+
   };
-  const map={date:get('date'),libelle:get('libelle'),debit:get('debit'),credit:get('credit'),montant:get('montant')};
-  if(map.date<0 || map.libelle<0 || (mode==='split' && map.debit<0 && map.credit<0) || (mode==='single' && map.montant<0)){
+  const map={date:get('date'),libelle:get('libelle'),libelleDep:get('libelleDep'),libelleRev:get('libelleRev'),debit:get('debit'),credit:get('credit'),montant:get('montant'),solde:get('solde')};
+  const libelleOk = libelleMode==='split' ? (map.libelleDep>=0 || map.libelleRev>=0) : map.libelle>=0;
+  const amountOk = amountMode==='split' ? (map.debit>=0 || map.credit>=0) : map.montant>=0;
+  if(map.date<0 || !libelleOk || !amountOk){
     const warn=document.getElementById('mappingWarn');
     warn.textContent='Sélectionne au moins la date, le libellé et une colonne de montant.';
     warn.classList.remove('hidden');
     return;
   }
   document.getElementById('mappingWarn').classList.add('hidden');
-  buildTransactions(map,mode);
+  buildTransactions(map,amountMode,libelleMode,skipFirstLast);
 });
 
-function buildTransactions(map,mode){
-  transactions=[];
+function buildTransactions(map,amountMode,libelleMode,skipFirstLast){
+  const newTx=[];
+  const usedKeys=new Set();
   let skipped=0;
+  let newSoldeDebut=null, newSoldeFin=null;
+  const lastIdx=rawRows.length-1;
+  if(skipFirstLast && map.solde>=0 && rawRows.length>=2){
+    const d0=parseFrenchDate(rawRows[0][map.date]);
+    const v0=parseFrenchNumber(rawRows[0][map.solde]);
+    const d1=parseFrenchDate(rawRows[lastIdx][map.date]);
+    const v1=parseFrenchNumber(rawRows[lastIdx][map.solde]);
+    if(d0 && !isNaN(v0)) newSoldeDebut={date:d0,value:v0};
+    if(d1 && !isNaN(v1)) newSoldeFin={date:d1,value:v1};
+  }
   rawRows.forEach((row,i)=>{
+    if(skipFirstLast && (i===0 || i===lastIdx)) return;
     const dateStr=row[map.date];
-    const libelle=(row[map.libelle]||'').trim();
+    let libelle, isIncomeHint=null;
+    if(libelleMode==='split'){
+      const dep=(map.libelleDep>=0 ? row[map.libelleDep] : '').trim();
+      const rev=(map.libelleRev>=0 ? row[map.libelleRev] : '').trim();
+      if(rev){ libelle=rev; isIncomeHint=true; }
+      else if(dep){ libelle=dep; isIncomeHint=false; }
+      else libelle='';
+    } else {
+      libelle=(row[map.libelle]||'').trim();
+    }
     const date=parseFrenchDate(dateStr);
     let montant;
-    if(mode==='split'){
+    if(amountMode==='split'){
       const d=map.debit>=0 ? parseFrenchNumber(row[map.debit]) : 0;
       const c=map.credit>=0 ? parseFrenchNumber(row[map.credit]) : 0;
       const dv=isNaN(d)?0:Math.abs(d);
@@ -499,28 +635,52 @@ function buildTransactions(map,mode){
       montant = cv - dv;
     } else {
       montant = parseFrenchNumber(row[map.montant]);
+      if(isIncomeHint===true) montant = Math.abs(montant);
+      else if(isIncomeHint===false) montant = -Math.abs(montant);
     }
     if(!date || !libelle || isNaN(montant) || montant===0){ skipped++; return; }
-    transactions.push({id:i,date,libelle,montant,category:null});
+    const key=makeTxKey(date,libelle,montant,usedKeys);
+    newTx.push({key,date,libelle,montant,category:null});
   });
+  const before=transactions.length;
+  const existingKeys=new Set(transactions.map(t=>t.key));
+  newTx.forEach(t=>{ if(!existingKeys.has(t.key)) transactions.push(t); });
+  const added=transactions.length-before;
   transactions.sort((a,b)=>a.date-b.date);
+  if(newSoldeDebut && (!soldeInfo.debut || newSoldeDebut.date < soldeInfo.debut.date)) soldeInfo.debut=newSoldeDebut;
+  if(newSoldeFin && (!soldeInfo.fin || newSoldeFin.date > soldeInfo.fin.date)) soldeInfo.fin=newSoldeFin;
   applyRules();
   renderRules();
   populateMonthFilter();
+  renderSoldeInfo(soldeInfo.debut,soldeInfo.fin);
   document.getElementById('mappingCard').classList.add('hidden');
   document.getElementById('dashboard').classList.remove('hidden');
   const warnEl=document.getElementById('parseWarn');
-  if(skipped>0){
-    warnEl.textContent=`${skipped} ligne(s) ignorée(s) (date, libellé ou montant illisible).`;
-    warnEl.classList.remove('hidden');
-  } else warnEl.classList.add('hidden');
+  const dupCount = newTx.length - added;
+  let msg='';
+  if(skipped>0) msg += `${skipped} ligne(s) ignorée(s) (date, libellé ou montant illisible). `;
+  if(dupCount>0) msg += `${dupCount} transaction(s) déjà présente(s), ignorée(s). `;
+  if(added>0) msg += `${added} nouvelle(s) transaction(s) ajoutée(s) à l'historique (total : ${transactions.length}).`;
+  if(msg){ warnEl.textContent=msg.trim(); warnEl.classList.remove('hidden'); }
+  else warnEl.classList.add('hidden');
+  saveState();
   render();
   document.getElementById('dashboard').scrollIntoView({behavior:'smooth',block:'start'});
 }
 
+function renderSoldeInfo(soldeDebut,soldeFin){
+  const el=document.getElementById('soldeInfo');
+  if(!soldeDebut && !soldeFin){ el.classList.add('hidden'); return; }
+  const parts=[];
+  if(soldeDebut) parts.push(`Solde au ${fmtDate(soldeDebut.date)} : ${fmtEUR(soldeDebut.value)}`);
+  if(soldeFin) parts.push(`Solde au ${fmtDate(soldeFin.date)} : ${fmtEUR(soldeFin.value)}`);
+  el.textContent = parts.join('  ·  ');
+  el.classList.remove('hidden');
+}
+
 function applyRules(){
   transactions.forEach(t=>{
-    if(manualOverrides[t.id]){ t.category=manualOverrides[t.id]; return; }
+    if(manualOverrides[t.key]){ t.category=manualOverrides[t.key]; return; }
     const c=matchCategory(t.libelle);
     t.category = c || (t.montant>0 ? 'Revenus — autre' : 'Dépenses — autre');
   });
@@ -630,10 +790,26 @@ function renderMonthChart(all){
   });
 }
 
+function cleanSenderName(libelle){
+  let s=libelle.trim().replace(/\s+/g,' ');
+  const prefixes=[
+    /^VIR(EMENT)?\s+INST(ANTANE)?\s+WERO\s+/i,
+    /^VIR(EMENT)?\s+INST(ANTANE)?\s+/i,
+    /^VIREMENT\s+DE\s+/i,
+    /^VIREMENT\s+/i,
+    /^VIR\s+/i,
+  ];
+  for(const p of prefixes){
+    if(p.test(s)){ s=s.replace(p,''); break; }
+  }
+  s=s.replace(/^(M|MME|MR|MLLE)\.?\s+/i,'');
+  return s.trim() || libelle.trim();
+}
+
 function renderSources(filtered){
   const bySource={};
   filtered.filter(t=>t.montant>0).forEach(t=>{
-    const key=t.libelle.trim().replace(/\s+/g,' ').slice(0,40);
+    const key=cleanSenderName(t.libelle).slice(0,40);
     bySource[key]=(bySource[key]||0)+t.montant;
   });
   const entries=Object.entries(bySource).sort((a,b)=>b[1]-a[1]).slice(0,12);
@@ -663,16 +839,17 @@ function renderTxTable(filtered){
     return `<tr>
       <td>${fmtDate(t.date)}</td>
       <td class="lib-cell" title="${t.libelle}">${t.libelle}</td>
-      <td><select class="cat-select" data-id="${t.id}">${options}</select></td>
+      <td><select class="cat-select" data-key="${encodeURIComponent(t.key)}">${options}</select></td>
       <td class="num ${cls}">${fmtEUR(t.montant)}</td>
     </tr>`;
   }).join('');
   body.innerHTML=rowsHtml || '<tr><td colspan="4" class="empty-hint">Aucune transaction sur cette période.</td></tr>';
   body.querySelectorAll('.cat-select').forEach(sel=>{
     sel.addEventListener('change',e=>{
-      const id=+e.target.dataset.id;
-      const tx=transactions.find(t=>t.id===id);
-      if(tx){ tx.category=e.target.value; manualOverrides[id]=e.target.value; }
+      const key=decodeURIComponent(e.target.dataset.key);
+      const tx=transactions.find(t=>t.key===key);
+      if(tx){ tx.category=e.target.value; manualOverrides[key]=e.target.value; }
+      saveState();
       render();
     });
   });
@@ -693,6 +870,7 @@ function renderRules(){
       rules.splice(i,1);
       applyRules();
       renderRules();
+      saveState();
       render();
     });
   });
@@ -708,6 +886,17 @@ document.getElementById('addRuleBtn').addEventListener('click',()=>{
   kwEl.value='';catEl.value='';
   applyRules();
   renderRules();
+  saveState();
+  render();
+});
+
+document.getElementById('resetRulesBtn').addEventListener('click',()=>{
+  if(!confirm('Réinitialiser toutes les règles et corrections manuelles ? Ton historique de transactions est conservé.')) return;
+  rules = DEFAULT_RULES.slice();
+  manualOverrides = {};
+  applyRules();
+  renderRules();
+  saveState();
   render();
 });
 
@@ -727,6 +916,7 @@ document.getElementById('importRulesInput').addEventListener('change',e=>{
         rules=imported.concat(rules.filter(r=>!imported.some(i=>norm(i.kw)===norm(r.kw))));
         applyRules();
         renderRules();
+        saveState();
         render();
       }
     }catch(err){}
