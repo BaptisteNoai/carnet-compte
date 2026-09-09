@@ -207,7 +207,7 @@
 </style>
 </head>
 <body>
-<div class="version-badge" title="v9 — objectifs par catégorie avec suggestions basées sur tes revenus, alertes excès et tolérance zéro (jeux d'argent), agrégation multi-comptes (courant, livrets, PEA...), interface arrondie type appli bancaire">v9</div>
+<div class="version-badge" title="v10 — corrige la détection quand les lignes n'ont pas toutes la même largeur, et mémorise définitivement la configuration validée par compte">v10</div>
 <div class="wrap">
   <h1>Mon carnet de comptes</h1>
   <p class="subtitle">Dépose ton export CSV LCL ci-dessous. <b>Rien n'est envoyé nulle part</b> : tout le calcul se fait dans ton navigateur, sur ta machine.</p>
@@ -428,7 +428,8 @@ function saveState(){
       soldeDebut: serializeSolde(soldeInfo.debut),
       soldeFin: serializeSolde(soldeInfo.fin),
       budgets,
-      lastAccountName
+      lastAccountName,
+      savedMappings
     }));
   }catch(e){}
 }
@@ -454,6 +455,7 @@ let soldeInfo = savedState ? {debut:deserializeSolde(savedState.soldeDebut), fin
 let budgets = savedState ? (savedState.budgets || {}) : {};
 let lastAccountName = savedState ? (savedState.lastAccountName || 'Compte courant') : 'Compte courant';
 let pendingAccountName = lastAccountName;
+let savedMappings = savedState ? (savedState.savedMappings || {}) : {};
 
 function stripAccents(s){return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');}
 function norm(s){return stripAccents((s||'').toLowerCase()).trim();}
@@ -613,15 +615,19 @@ function guessNoHeaderRow(row0){
 
 function detectKnownLCLFormat(rows){
   // Format LCL sans en-tête : A date, B montant (signé), C type, D vide, E libellé dépense, F libellé revenu
+  // Les lignes n'ont pas forcément toutes la même largeur (cellules vides parfois tronquées en fin de ligne),
+  // donc on se base sur la ligne la plus large du fichier pour savoir si le format E/F existe.
   if(!rows || rows.length<3) return null;
+  const maxCols=Math.max(...rows.map(r=>r ? r.length : 0));
+  if(maxCols<6) return null;
   const row0=rows[0];
-  if(!row0 || row0.length<6) return null;
+  if(!row0 || row0.length<1) return null;
   if(!parseFrenchDate(row0[0])) return null;
-  if(isNaN(parseFrenchNumber(row0[1]))) return null;
+  if(row0.length<2 || isNaN(parseFrenchNumber(row0[1]))) return null;
   const sample=rows.slice(1, Math.min(rows.length-1, 8));
   let ok=0;
   sample.forEach(r=>{
-    if(r && r[0] && parseFrenchDate(r[0]) && !isNaN(parseFrenchNumber(r[1]))) ok++;
+    if(r && r[0] && r.length>1 && parseFrenchDate(r[0]) && !isNaN(parseFrenchNumber(r[1]))) ok++;
   });
   if(ok < Math.min(3, sample.length)) return null;
   return {
@@ -641,12 +647,29 @@ function processText(text){
     return;
   }
   fullRows=rows;
+
+  const remembered=savedMappings[pendingAccountName];
+  if(remembered){
+    noHeaderRow=remembered.noHeaderRow;
+    if(noHeaderRow){
+      headers=fullRows[0].map((_,i)=>'Colonne '+String.fromCharCode(65+i));
+      rawRows=fullRows;
+    } else {
+      headers=(fullRows[0]||[]).map(h=>h.trim());
+      rawRows=fullRows.slice(1);
+    }
+    buildTransactions(remembered.map, remembered.amountMode, remembered.libelleMode, remembered.skipFirstLast);
+    return;
+  }
+
   const known=detectKnownLCLFormat(rows);
   if(known){
     noHeaderRow=true;
     headers=fullRows[0].map((_,i)=>'Colonne '+String.fromCharCode(65+i));
     rawRows=fullRows;
     buildTransactions(known.map, known.amountMode, known.libelleMode, known.skipFirstLast);
+    savedMappings[pendingAccountName]={map:known.map, amountMode:known.amountMode, libelleMode:known.libelleMode, skipFirstLast:known.skipFirstLast, noHeaderRow:true};
+    saveState();
     return;
   }
   noHeaderRow=guessNoHeaderRow(rows[0]);
@@ -670,7 +693,7 @@ function guessAllColumns(headersNorm, candidates){
 function buildMappingUI(){
   document.getElementById('noHeaderRow').checked = noHeaderRow;
   if(noHeaderRow){
-    const colCount = fullRows[0] ? fullRows[0].length : 0;
+    const colCount = fullRows.length ? Math.max(...fullRows.map(r=>r?r.length:0)) : 0;
     headers = Array.from({length:colCount},(_,i)=>'Colonne '+String.fromCharCode(65+i));
     rawRows = fullRows;
   } else {
@@ -690,7 +713,7 @@ function buildMappingUI(){
     // Format LCL sans en-tête : A date, B montant, C type, D solde, E libellé dépense, F libellé revenu
     if(dateIdx<0) dateIdx=0;
     if(montantIdx<0 && debitIdx<0 && creditIdx<0 && headers.length>1) montantIdx=1;
-    if(soldeIdx<0 && headers.length>3 && fullRows[0] && !isNaN(parseFrenchNumber(fullRows[0][3])) && fullRows[0][3].trim()!=='') soldeIdx=3;
+    if(soldeIdx<0 && headers.length>3 && fullRows[0] && fullRows[0][3]!==undefined && !isNaN(parseFrenchNumber(fullRows[0][3])) && fullRows[0][3].trim()!=='') soldeIdx=3;
     if(libMatches.length<2 && headers.length>=6) libMatches=[4,5];
   }
 
@@ -780,6 +803,8 @@ document.getElementById('validateMapping').addEventListener('click',()=>{
     return;
   }
   document.getElementById('mappingWarn').classList.add('hidden');
+  savedMappings[pendingAccountName]={map, amountMode, libelleMode, skipFirstLast, noHeaderRow};
+  saveState();
   buildTransactions(map,amountMode,libelleMode,skipFirstLast);
 });
 
@@ -813,8 +838,8 @@ function buildTransactions(map,amountMode,libelleMode,skipFirstLast){
     const dateStr=row[map.date];
     let libelle;
     if(libelleMode==='split'){
-      const dep=(map.libelleDep>=0 ? row[map.libelleDep] : '').trim();
-      const rev=(map.libelleRev>=0 ? row[map.libelleRev] : '').trim();
+      const dep=(map.libelleDep>=0 ? (row[map.libelleDep]||'') : '').trim();
+      const rev=(map.libelleRev>=0 ? (row[map.libelleRev]||'') : '').trim();
       libelle = dep || rev || '';
     } else {
       libelle=(row[map.libelle]||'').trim();
